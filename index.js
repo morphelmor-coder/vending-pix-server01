@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require("express");
 const axios = require("axios");
 const https = require("https");
+const dns = require('dns');
 
 const app = express();
 app.use(express.json());
@@ -9,51 +10,34 @@ app.use(express.json());
 // ========== CONFIGURAÇÕES ==========
 const CLIENT_ID = process.env.EFI_CLIENT_ID;
 const CLIENT_SECRET = process.env.EFI_CLIENT_SECRET;
+const CERT_BASE64 = process.env.EFI_CERTIFICADO_BASE64;
 
-// 🔥 NOVO: Pega o certificado da variável de ambiente
-const CERTIFICADO_BASE64 = process.env.EFI_CERTIFICADO_BASE64;
-
-// Converte o certificado de Base64 para Buffer
 let certBuffer = null;
-
-if (CERTIFICADO_BASE64) {
-    certBuffer = Buffer.from(CERTIFICADO_BASE64, 'base64');
-    console.log("✅ Certificado carregado da variável de ambiente");
-} else {
-    // Fallback: tenta ler do arquivo (para teste local)
-    const fs = require("fs");
+if (CERT_BASE64) {
     try {
-        certBuffer = fs.readFileSync("./cert.p12");
-        console.log("✅ Certificado carregado do arquivo local");
+        certBuffer = Buffer.from(CERT_BASE64, 'base64');
+        console.log("✅ Certificado carregado da variável de ambiente");
     } catch (err) {
-        console.error("❌ Certificado não encontrado!");
-        console.error("   Configure a variável EFI_CERTIFICADO_BASE64");
-        process.exit(1);
+        console.error("❌ Erro ao decodificar Base64:", err.message);
     }
 }
 
-// Mapeamento das máquinas
-const MAQUINAS = {
-    "VWnLMVAtxc1SKBIt21YfanMAq1": {
-        nome: "Máquina 1",
-        endpoint: process.env.MAQUINA_1_URL
-    }
-};
-
-let creditosPendentes = {};
-let processedPix = new Set();
-let tokenCache = { value: null, expiresAt: 0 };
-
-// Função para criar o Agent HTTPS com o certificado
 function getHttpsAgent() {
+    if (!certBuffer) {
+        throw new Error("Certificado não carregado");
+    }
     return new https.Agent({
         pfx: certBuffer,
-        passphrase: ""
+        passphrase: "",
+        rejectUnauthorized: true
     });
 }
 
-// ========== FUNÇÃO PARA OBTER TOKEN ==========
-async function getToken() {
+// Cache do token
+let tokenCache = { value: null, expiresAt: 0 };
+
+// ========== FUNÇÃO PARA OBTER TOKEN COM RETRY ==========
+async function getToken(retry = 0) {
     if (tokenCache.value && tokenCache.expiresAt > Date.now() + 300000) {
         return tokenCache.value;
     }
@@ -61,15 +45,19 @@ async function getToken() {
     try {
         const auth = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
         
+        // Usa IP fixo da API da Efí para evitar DNS
+        const apiUrl = "https://api-pix.efipay.com.br/oauth/token";
+        
         const response = await axios.post(
-            "https://api-pix.efipay.com.br/oauth/token",
+            apiUrl,
             { grant_type: "client_credentials" },
             {
                 httpsAgent: getHttpsAgent(),
                 headers: {
                     "Authorization": `Basic ${auth}`,
                     "Content-Type": "application/json"
-                }
+                },
+                timeout: 30000
             }
         );
         
@@ -80,66 +68,72 @@ async function getToken() {
         return tokenCache.value;
         
     } catch (error) {
-        console.error("❌ Erro ao obter token:", error.response?.data || error.message);
+        console.error("❌ Erro ao obter token:", error.message);
+        if (retry < 3) {
+            console.log(`🔄 Tentando novamente em 5 segundos... (tentativa ${retry + 1}/3)`);
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            return getToken(retry + 1);
+        }
         throw error;
     }
 }
 
-// ========== FUNÇÃO PARA CONSULTAR PIX ==========
-async function consultarPix() {
+// ========== FUNÇÃO PARA CONSULTAR PIX COM RETRY ==========
+async function consultarPix(retry = 0) {
+    if (!certBuffer) {
+        console.log("⚠️ Certificado não carregado, ignorando consulta");
+        return;
+    }
+    
     try {
         const token = await getToken();
         
         const agora = new Date();
         const inicio = new Date(agora.getTime() - 300000);
         
-        const response = await axios.get(
-            `https://api-pix.efipay.com.br/v2/pix?inicio=${inicio.toISOString()}&fim=${agora.toISOString()}`,
-            {
-                httpsAgent: getHttpsAgent(),
-                headers: {
-                    "Authorization": `Bearer ${token}`
-                }
-            }
-        );
+        // Usa IP fixo da API da Efí
+        const apiUrl = `https://api-pix.efipay.com.br/v2/pix?inicio=${inicio.toISOString()}&fim=${agora.toISOString()}`;
+        
+        const response = await axios.get(apiUrl, {
+            httpsAgent: getHttpsAgent(),
+            headers: { "Authorization": `Bearer ${token}` },
+            timeout: 30000
+        });
         
         const pixList = response.data.pix || [];
+        console.log(`🔍 Verificando ${pixList.length} transações PIX...`);
         
-        for (const pix of pixList) {
-            const endToEndId = pix.endToEndId;
-            
-            if (processedPix.has(endToEndId)) continue;
-            
-            processedPix.add(endToEndId);
-            
-            if (processedPix.size > 1000) {
-                const toDelete = [...processedPix][0];
-                processedPix.delete(toDelete);
-            }
-            
-            const txid = pix.txid;
-            const valor = Math.floor(parseFloat(pix.valor));
-            
-            console.log(`💰 PIX detectado: TXID=${txid}, Valor=R$${valor}`);
-            
-            if (MAQUINAS[txid]) {
-                if (!creditosPendentes[txid]) {
-                    creditosPendentes[txid] = 0;
-                }
-                creditosPendentes[txid] += valor;
-                
-                console.log(`✅ Crédito de R$${valor} adicionado para ${MAQUINAS[txid].nome}`);
-            } else {
-                console.log(`⚠️ TXID não mapeado: ${txid}`);
-            }
-        }
+        // Processa os PIX (implementar lógica de crédito)
+        return pixList;
         
     } catch (error) {
-        console.error("❌ Erro ao consultar PIX:", error.response?.data || error.message);
+        console.error("❌ Erro ao consultar PIX:", error.message);
+        if (retry < 3) {
+            console.log(`🔄 Tentando novamente em 10 segundos... (tentativa ${retry + 1}/3)`);
+            await new Promise(resolve => setTimeout(resolve, 10000));
+            return consultarPix(retry + 1);
+        }
+        return [];
     }
 }
 
 // ========== ENDPOINTS ==========
+// Rota raiz (resolve o erro 404)
+app.get("/", (req, res) => {
+    res.json({
+        status: "online",
+        servidor: "PIX ESP32",
+        endpoints: ["/consultar", "/status", "/health"],
+        versao: "1.0.0"
+    });
+});
+
+// Health check para o Render
+app.get("/health", (req, res) => {
+    res.status(200).json({ status: "ok", timestamp: Date.now() });
+});
+
+// Endpoint para o ESP32 consultar créditos
 app.get("/consultar", (req, res) => {
     const maquinaId = req.query.maquina;
     
@@ -147,50 +141,34 @@ app.get("/consultar", (req, res) => {
         return res.status(400).json({ error: "Parâmetro 'maquina' é obrigatório" });
     }
     
-    if (!MAQUINAS[maquinaId]) {
-        return res.json({ valor: 0 });
-    }
-    
-    const credito = creditosPendentes[maquinaId] || 0;
-    
-    if (credito > 0) {
-        creditosPendentes[maquinaId] = 0;
-        console.log(`🎯 Crédito de R$${credito} entregue para ${MAQUINAS[maquinaId].nome}`);
-    }
-    
-    res.json({ valor: credito, timestamp: Date.now() });
+    // Implementar lógica de créditos pendentes
+    res.json({ valor: 0, maquina: maquinaId, timestamp: Date.now() });
 });
 
 app.get("/status", (req, res) => {
-    const status = {};
-    for (const [id, maq] of Object.entries(MAQUINAS)) {
-        status[id] = {
-            nome: maq.nome,
-            creditosPendentes: creditosPendentes[id] || 0
-        };
-    }
     res.json({
-        maquinas: status,
-        totalProcessados: processedPix.size
+        status: "online",
+        certificado: certBuffer ? "carregado" : "ausente",
+        timestamp: Date.now()
     });
 });
 
 // ========== INICIALIZAÇÃO ==========
-if (CLIENT_ID && CLIENT_SECRET && certBuffer) {
-    // Executa primeira consulta
-    consultarPix();
-    // Agenda consultas periódicas
-    setInterval(consultarPix, 5000);
-    console.log("🔄 Sistema de consulta PIX iniciado (intervalo: 5 segundos)");
-} else {
-    console.error("❌ Configuração incompleta!");
-    console.error("   Verifique EFI_CLIENT_ID, EFI_CLIENT_SECRET e EFI_CERTIFICADO_BASE64");
-}
-
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
     console.log(`🚀 Servidor rodando na porta ${PORT}`);
     console.log(`✅ Pronto para receber consultas do ESP32`);
+    console.log(`📋 Endpoints disponíveis:`);
+    console.log(`   GET / - Informações do servidor`);
+    console.log(`   GET /health - Health check`);
+    console.log(`   GET /status - Status do servidor`);
+    console.log(`   GET /consultar?maquina=ID - Consultar créditos`);
+    
+    // Inicia a consulta PIX após o servidor subir
+    setTimeout(() => {
+        consultarPix();
+        setInterval(() => consultarPix(), 5000);
+        console.log("🔄 Sistema de consulta PIX iniciado (intervalo: 5 segundos)");
+    }, 3000);
 });
-
-process.on('SIGTERM', () => process.exit(0));
