@@ -7,22 +7,24 @@ const fs = require("fs");
 const app = express();
 app.use(express.json());
 
-// ==================== CONFIGURAÇÕES ====================
+// ========== CONFIGURAÇÕES ==========
 const CLIENT_ID = process.env.EFI_CLIENT_ID;
 const CLIENT_SECRET = process.env.EFI_CLIENT_SECRET;
 const CERT_BASE64 = process.env.EFI_CERTIFICADO_BASE64;
-
-// ⚠️ URL CORRETA - Este é o ponto mais importante!
 const EFI_API_URL = "https://pix.api.efipay.com.br";
 
+// ========== ESTADO DO SISTEMA ==========
+let creditosPendentes = {};        // TXID -> valor pendente
+let processedPix = new Set();       // Evita processar o mesmo PIX duas vezes
+let tokenCache = { value: null, expiresAt: 0 };
 let httpsAgent = null;
 
+// ========== CONFIGURAÇÃO DO CERTIFICADO ==========
 if (CERT_BASE64) {
     try {
         const tempCertPath = "/tmp/certificado.p12";
         const certBuffer = Buffer.from(CERT_BASE64, 'base64');
         fs.writeFileSync(tempCertPath, certBuffer);
-        
         httpsAgent = new https.Agent({
             pfx: fs.readFileSync(tempCertPath),
             passphrase: "",
@@ -35,109 +37,97 @@ if (CERT_BASE64) {
     }
 }
 
-let tokenCache = { value: null, expiresAt: 0 };
-
-// ==================== TOKEN ====================
+// ========== TOKEN ==========
 async function getToken() {
     if (tokenCache.value && tokenCache.expiresAt > Date.now() + 300000) {
         return tokenCache.value;
     }
-    
     if (!httpsAgent) return null;
-    
     try {
         const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
-        
-        // Usando a URL CORRETA
         const response = await axios.post(
             `${EFI_API_URL}/oauth/token`,
             { grant_type: "client_credentials" },
             {
                 httpsAgent: httpsAgent,
-                headers: {
-                    "Authorization": `Basic ${credentials}`,
-                    "Content-Type": "application/json"
-                },
+                headers: { "Authorization": `Basic ${credentials}`, "Content-Type": "application/json" },
                 timeout: 30000
             }
         );
-        
         tokenCache.value = response.data.access_token;
         tokenCache.expiresAt = Date.now() + 6900000;
-        console.log("✅ Token obtido com sucesso!");
+        console.log("✅ Token obtido");
         return tokenCache.value;
-        
     } catch (error) {
-        console.error("❌ Erro no token:", error.response?.data || error.message);
+        console.error("❌ Erro token:", error.response?.data || error.message);
         return null;
     }
 }
 
-// ==================== CONSULTAR PIX ====================
+// ========== CONSULTAR PIX E ACUMULAR CRÉDITO ==========
 async function consultarPix() {
     const token = await getToken();
     if (!token) return;
-    
     try {
         const agora = new Date();
-        const inicio = new Date(agora.getTime() - 300000);
-        
+        const inicio = new Date(agora.getTime() - 10 * 60 * 1000); // 10 minutos atrás
         const response = await axios.get(
             `${EFI_API_URL}/v2/pix?inicio=${inicio.toISOString()}&fim=${agora.toISOString()}`,
-            {
-                httpsAgent: httpsAgent,
-                headers: { "Authorization": `Bearer ${token}` },
-                timeout: 30000
-            }
+            { httpsAgent: httpsAgent, headers: { "Authorization": `Bearer ${token}` }, timeout: 30000 }
         );
-        
         const pixList = response.data.pix || [];
-        if (pixList.length > 0) {
-            console.log(`💰 ${pixList.length} PIX encontrado(s)!`);
-            // Aqui você adiciona a lógica para cada PIX
-        } else {
-            console.log(`🔍 Nenhum PIX novo.`);
+        if (pixList.length === 0) return;
+        console.log(`💰 ${pixList.length} PIX encontrado(s)!`);
+        for (const pix of pixList) {
+            const endToEndId = pix.endToEndId;
+            if (processedPix.has(endToEndId)) continue;
+            processedPix.add(endToEndId);
+            const txid = pix.txid || "SEM_TXID";
+            const valor = Math.floor(parseFloat(pix.valor));
+            console.log(`   PIX: ${txid} | R$ ${valor}`);
+            // ACUMULA O CRÉDITO (independente do TXID, mas você pode filtrar)
+            creditosPendentes[txid] = (creditosPendentes[txid] || 0) + valor;
+            console.log(`   ✅ Crédito acumulado para ${txid}. Total pendente: R$ ${creditosPendentes[txid]}`);
         }
+        if (processedPix.size > 1000) processedPix.clear();
     } catch (error) {
-        console.error("❌ Erro na consulta:", error.response?.data || error.message);
+        console.error("❌ Erro PIX:", error.message);
     }
 }
 
-// ==================== ENDPOINTS ====================
-app.get("/", (req, res) => {
-    res.json({
-        status: "online",
-        servidor: "PIX ESP32",
-        api_url: EFI_API_URL,
-        endpoints: ["/consultar", "/status", "/health"]
-    });
-});
-
-app.get("/health", (req, res) => res.json({ status: "ok" }));
-app.get("/status", (req, res) => {
-    res.json({
-        status: "online",
-        api_url: EFI_API_URL,
-        token_valido: tokenCache.value ? "sim" : "não"
-    });
-});
+// ========== ENDPOINTS ==========
+app.get("/", (req, res) => res.json({ status: "online", creditos_pendentes: creditosPendentes }));
+app.get("/status", (req, res) => res.json({ token_valido: !!tokenCache.value, creditos_pendentes: creditosPendentes }));
 app.get("/consultar", (req, res) => {
-    res.json({ valor: 0, maquina: req.query.maquina, timestamp: Date.now() });
+    const maquinaId = req.query.maquina;
+    if (!maquinaId) return res.status(400).json({ error: "Parâmetro 'maquina' é obrigatório" });
+    const credito = creditosPendentes[maquinaId] || 0;
+    if (credito > 0) delete creditosPendentes[maquinaId];
+    res.json({ valor: credito, maquina: maquinaId });
+});
+app.get("/debug", async (req, res) => {
+    const token = await getToken();
+    if (!token) return res.json({ erro: "Sem token" });
+    try {
+        const agora = new Date();
+        const inicio = new Date(agora.getTime() - 24 * 60 * 60 * 1000);
+        const response = await axios.get(
+            `${EFI_API_URL}/v2/pix?inicio=${inicio.toISOString()}&fim=${agora.toISOString()}`,
+            { httpsAgent: httpsAgent, headers: { "Authorization": `Bearer ${token}` } }
+        );
+        res.json({ total: response.data.pix?.length || 0, transacoes: response.data.pix || [] });
+    } catch (error) {
+        res.status(500).json({ erro: error.message });
+    }
 });
 
-// ==================== INÍCIO ====================
+// ========== INÍCIO ==========
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-    console.log(`🚀 Servidor rodando na porta ${PORT}`);
-    console.log(`🔗 API Efí: ${EFI_API_URL}`);
-    
-    setTimeout(async () => {
-        const token = await getToken();
-        if (token) {
-            console.log("🎯 Conexão com Efí estabelecida!");
-            setInterval(() => consultarPix(), 10000);
-        } else {
-            console.log("⚠️ Falha na conexão com Efí.");
-        }
-    }, 2000);
+    console.log(`🚀 Servidor na porta ${PORT}`);
+    if (await getToken()) {
+        console.log("✅ Autenticado. Iniciando polling...");
+        setInterval(consultarPix, 10000);
+        consultarPix();
+    } else console.log("❌ Falha autenticação.");
 });
